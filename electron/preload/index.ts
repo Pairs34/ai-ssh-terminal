@@ -63,17 +63,43 @@ const api = {
       const listener = (_e: unknown, data: { sessionId: number; step: string; message: string }) => callback(data);
       ipcRenderer.on("ai:status", listener);
       return () => ipcRenderer.removeListener("ai:status", listener);
+    },
+    onStep: (callback: (data: {
+      sessionId: number;
+      id: string;
+      kind: string;
+      title: string;
+      detail?: string;
+      status: "running" | "done" | "error";
+    }) => void) => {
+      const listener = (_e: unknown, data: {
+        sessionId: number;
+        id: string;
+        kind: string;
+        title: string;
+        detail?: string;
+        status: "running" | "done" | "error";
+      }) => callback(data);
+      ipcRenderer.on("ai:step", listener);
+      return () => ipcRenderer.removeListener("ai:step", listener);
+    },
+    onToken: (callback: (data: { sessionId: number; token: string }) => void) => {
+      const listener = (_e: unknown, data: { sessionId: number; token: string }) => callback(data);
+      ipcRenderer.on("ai:token", listener);
+      return () => ipcRenderer.removeListener("ai:token", listener);
     }
   },
   prompts: {
     list: () => ipcRenderer.invoke("prompts:list"),
     save: (data: unknown) => ipcRenderer.invoke("prompts:save", data),
     setDefault: (id: number) => ipcRenderer.invoke("prompts:setDefault", id),
+    setEnabled: (id: number, enabled: boolean) => ipcRenderer.invoke("prompts:setEnabled", id, enabled),
     delete: (id: number) => ipcRenderer.invoke("prompts:delete", id)
   },
   playbooks: {
     list: () => ipcRenderer.invoke("playbooks:list"),
     save: (data: unknown) => ipcRenderer.invoke("playbooks:save", data),
+    setEnabled: (id: number, enabled: boolean) => ipcRenderer.invoke("playbooks:setEnabled", id, enabled),
     delete: (id: number) => ipcRenderer.invoke("playbooks:delete", id)
   },
   rag: {

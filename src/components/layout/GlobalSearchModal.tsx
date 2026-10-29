@@ -59,12 +59,11 @@ export function GlobalSearchModal({ isOpen, onClose, onNavigate }: GlobalSearchM
             id: `pb-${p.id}`,
             type: "playbook",
             title: `@${p.tag} - ${p.title}`,
-            subtitle: p.description || "Playbook teşhis senaryosu",
+            subtitle: p.description || "Skill / teşhis senaryosu",
             page: "playbooks"
           });
         });
 
-        // 3. Prompts
         (prmpts as { id: number; title: string; promptText: string }[]).forEach((pr) => {
           items.push({
             id: `pr-${pr.id}`,

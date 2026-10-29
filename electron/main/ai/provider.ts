@@ -52,6 +52,14 @@ export function getAiConfig(): AiProviderConfig | null {
   return currentConfig;
 }
 
+function normalizeAiText(content: string): string {
+  let normalized = content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  if (normalized.startsWith("```markdown")) {
+    normalized = normalized.replace(/^```markdown\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+  return normalized;
+}
+
 export async function callAiText(messages: AiChatMessage[]): Promise<string> {
   const config = getAiConfig();
   if (!config || !config.baseUrl || !config.model) {
@@ -88,13 +96,76 @@ export async function callAiText(messages: AiChatMessage[]): Promise<string> {
   let content = data.choices?.[0]?.message?.content;
   if (!content) throw new Error("AI yanıtı boş döndü.");
 
-  content = content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  return normalizeAiText(content);
+}
 
-  if (content.startsWith("```markdown")) {
-    content = content.replace(/^```markdown\s*/i, "").replace(/\s*```$/, "").trim();
+export async function callAiTextStream(
+  messages: AiChatMessage[],
+  onToken?: (token: string) => void
+): Promise<string> {
+  const config = getAiConfig();
+  if (!config || !config.baseUrl || !config.model) {
+    throw new Error("AI sağlayıcı yapılandırılmamış. Ayarlar bölümünden API bilgilerini ve modelinizi girin.");
   }
 
-  return content;
+  const cleanBaseUrl = config.baseUrl.replace(/\/+$/, "");
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json"
+  };
+  if (config.apiKey) {
+    headers["Authorization"] = `Bearer ${config.apiKey}`;
+  }
+
+  const body: Record<string, unknown> = {
+    model: config.model,
+    messages,
+    temperature: 0.3,
+    stream: true
+  };
+
+  const response = await fetch(`${cleanBaseUrl}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok || !response.body) {
+    return callAiText(messages);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(payload) as { choices?: { delta?: { content?: string } }[] };
+        const token = parsed.choices?.[0]?.delta?.content;
+        if (token) {
+          content += token;
+          onToken?.(token);
+        }
+      } catch {
+      }
+    }
+  }
+
+  if (!content.trim()) {
+    return callAiText(messages);
+  }
+
+  return normalizeAiText(content);
 }
 
 export async function callAiJson<T>(messages: AiChatMessage[]): Promise<T> {

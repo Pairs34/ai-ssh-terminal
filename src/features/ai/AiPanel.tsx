@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy, Loader2, RotateCcw, Send, ShieldAlert, X as XIcon, Zap } from "lucide-react";
-import type { AiAskResult, AiCommandApproval } from "@/types/ipc";
+import type { AiAskResult, AiCommandApproval, AiTimelineStep } from "@/types/ipc";
 import { toUserFacingError } from "@/lib/errors";
 import { restoreConversationTimeline } from "./restoreHistory";
 
@@ -18,6 +18,9 @@ interface ChatTimelineEntry {
   historicalResponse?: string | null;
   approvalOutput?: string | null;
   approvalCanceled?: boolean;
+  steps?: AiTimelineStep[];
+  streamingText?: string;
+  pending?: boolean;
   timestamp: string;
 }
 
@@ -90,17 +93,25 @@ function renderMarkdownWithTables(text: string) {
   return elements;
 }
 
+function stepTone(status: AiTimelineStep["status"]) {
+  if (status === "done") return "border-success/30 bg-success/10 text-success";
+  if (status === "error") return "border-danger/30 bg-danger/10 text-danger";
+  return "border-ask/30 bg-ask/10 text-ask";
+}
+
 export function AiPanel({ deviceId, sessionId, tabSessionId }: AiPanelProps) {
   const [inputText, setInputText] = useState("");
   const [timeline, setTimeline] = useState<ChatTimelineEntry[]>([]);
   const [queue, setQueue] = useState<QueuedItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [currentStatus, setCurrentStatus] = useState<string | null>(null);
+  const [activeEntryId, setActiveEntryId] = useState<string | null>(null);
   const [copiedIndex, setCopiedIndex] = useState<string | null>(null);
   const [availablePlaybooks, setAvailablePlaybooks] = useState<{ tag: string; title: string; description?: string | null }[]>([]);
   const [showMentionPicker, setShowMentionPicker] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const activeEntryIdRef = useRef<string | null>(null);
 
   useEffect(() => { window.electronAPI.playbooks.list().then(setAvailablePlaybooks); }, []);
 
@@ -108,6 +119,8 @@ export function AiPanel({ deviceId, sessionId, tabSessionId }: AiPanelProps) {
     let canceled = false;
     setTimeline([]);
     setQueue([]);
+    setActiveEntryId(null);
+    activeEntryIdRef.current = null;
     window.electronAPI.history.getSessionMessages(sessionId).then((detail) => {
       if (canceled) return;
       setTimeline(restoreConversationTimeline(detail.messages).map((entry) => ({
@@ -132,22 +145,70 @@ export function AiPanel({ deviceId, sessionId, tabSessionId }: AiPanelProps) {
     if (data.sessionId === sessionId) setCurrentStatus(data.message);
   }), [sessionId]);
 
+  useEffect(() => window.electronAPI.ai.onStep((data) => {
+    if (data.sessionId !== sessionId) return;
+    const entryId = activeEntryIdRef.current;
+    if (!entryId) return;
+    setTimeline((previous) => previous.map((entry) => {
+      if (entry.id !== entryId) return entry;
+      const steps = [...(entry.steps || [])];
+      const index = steps.findIndex((step) => step.id === data.id);
+      const nextStep: AiTimelineStep = {
+        id: data.id,
+        kind: data.kind,
+        title: data.title,
+        detail: data.detail,
+        status: data.status
+      };
+      if (index >= 0) steps[index] = nextStep;
+      else steps.push(nextStep);
+      return { ...entry, steps };
+    }));
+  }), [sessionId]);
+
+  useEffect(() => window.electronAPI.ai.onToken((data) => {
+    if (data.sessionId !== sessionId) return;
+    const entryId = activeEntryIdRef.current;
+    if (!entryId) return;
+    setTimeline((previous) => previous.map((entry) =>
+      entry.id === entryId
+        ? { ...entry, streamingText: `${entry.streamingText || ""}${data.token}` }
+        : entry
+    ));
+  }), [sessionId]);
+
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [timeline, queue, loading]);
+  }, [timeline, queue, loading, currentStatus]);
 
   const executePrompt = async (item: QueuedItem) => {
     setLoading(true);
     setCurrentStatus("🔍 Teşhis başlatılıyor...");
     const timestamp = new Date().toLocaleTimeString();
+    activeEntryIdRef.current = item.id;
+    setActiveEntryId(item.id);
+    setTimeline((previous) => [...previous, {
+      id: item.id,
+      prompt: item.prompt,
+      pending: true,
+      steps: [],
+      streamingText: "",
+      timestamp
+    }]);
     try {
       const askResult = await window.electronAPI.ai.ask({ deviceId, sessionId, tabSessionId, question: item.prompt });
-      setTimeline((previous) => [...previous, { id: item.id, prompt: item.prompt, askResult, timestamp }]);
+      setTimeline((previous) => previous.map((entry) => entry.id === item.id
+        ? { ...entry, askResult, pending: false, streamingText: undefined, error: null }
+        : entry));
     } catch (error) {
-      setTimeline((previous) => [...previous, { id: item.id, prompt: item.prompt, error: toUserFacingError(error), timestamp }]);
+      setTimeline((previous) => previous.map((entry) => entry.id === item.id
+        ? { ...entry, error: toUserFacingError(error), pending: false }
+        : entry));
     } finally {
       setLoading(false);
       setCurrentStatus(null);
+      activeEntryIdRef.current = null;
+      setActiveEntryId(null);
     }
   };
 
@@ -212,7 +273,7 @@ export function AiPanel({ deviceId, sessionId, tabSessionId }: AiPanelProps) {
 
   const copyFullChat = () => {
     const text = timeline.map((entry) => {
-      const answer = entry.askResult?.explanation || entry.historicalResponse || entry.error || "";
+      const answer = entry.askResult?.explanation || entry.historicalResponse || entry.streamingText || entry.error || "";
       return `[Kullanıcı Prompt - ${entry.timestamp}]:\n${entry.prompt}\n\n[AI Yanıtı]:\n${answer}`;
     }).join("\n-----------------------------------\n");
     copyToClipboard(text, "full");
@@ -262,11 +323,35 @@ export function AiPanel({ deviceId, sessionId, tabSessionId }: AiPanelProps) {
     <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto p-3">
       {timeline.map((entry) => {
         const approval = entry.askResult?.pendingApproval;
+        const showStream = Boolean(entry.pending && entry.streamingText && !entry.askResult);
         return <div key={entry.id} className="space-y-2 rounded-card border border-border/80 bg-base-panel/60 p-3">
           <div className="flex items-start justify-between gap-2 border-b border-border/40 pb-1.5">
             <div className="min-w-0 break-words text-xs font-semibold text-white">{entry.prompt}</div>
             <span className="shrink-0 font-mono text-[10px] text-muted-foreground">{entry.timestamp}</span>
           </div>
+
+          {entry.steps && entry.steps.length > 0 && <div className="space-y-1.5">
+            {entry.steps.map((step) => (
+              <div key={step.id} className={`rounded border px-2.5 py-1.5 text-[11px] ${stepTone(step.status)}`}>
+                <div className="flex items-center gap-1.5 font-semibold">
+                  {step.status === "running" && <Loader2 size={11} className="animate-spin" />}
+                  {step.title}
+                </div>
+                {step.detail && <div className="mt-0.5 whitespace-pre-wrap font-mono text-[10px] opacity-80">{step.detail}</div>}
+              </div>
+            ))}
+          </div>}
+
+          {entry.pending && entry.id === activeEntryId && !showStream && <div className="flex items-center gap-2 rounded-card border border-ask/30 bg-ask-muted/20 p-2.5 text-xs font-medium text-ask">
+            <Loader2 size={14} className="animate-spin" /> {currentStatus || "İşlem yürütülüyor..."}
+          </div>}
+
+          {showStream && <div className="rounded-card border border-ask/30 bg-ask/5 p-3">
+            <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide text-ask">
+              <Loader2 size={11} className="animate-spin" /> Yanıt yazılıyor
+            </div>
+            <div>{renderMarkdownWithTables(entry.streamingText || "")}</div>
+          </div>}
 
           {entry.error && <div className="rounded-card border border-danger/30 bg-danger/10 p-2 text-xs text-danger">{entry.error}</div>}
           {entry.askResult && <div className="space-y-2 pt-1 text-xs">
@@ -307,10 +392,6 @@ export function AiPanel({ deviceId, sessionId, tabSessionId }: AiPanelProps) {
         </div>;
       })}
 
-      {loading && <div className="flex items-center gap-2 rounded-card border border-ask/30 bg-ask-muted/20 p-3 text-xs font-medium text-ask">
-        <Loader2 size={14} className="animate-spin" /> {currentStatus || "İşlem yürütülüyor..."}
-      </div>}
-
       {queue.length > 0 && <div className="space-y-2 border-t border-border/60 pt-2">
         <div className="flex items-center gap-1.5 text-[11px] font-bold text-muted-foreground"><Zap size={12} className="text-ask" /> Bekleyen sorular ({queue.length})</div>
         {queue.map((item) => <div key={item.id} className="flex items-center justify-between rounded-card border border-border bg-base-elevated p-2.5 text-xs">
@@ -324,14 +405,14 @@ export function AiPanel({ deviceId, sessionId, tabSessionId }: AiPanelProps) {
     </div>
 
     {showMentionPicker && filteredPlaybooks.length > 0 && <div className="z-20 mx-2 mb-1 overflow-hidden rounded-card border border-ask/40 bg-base-elevated shadow-2xl">
-      <div className="border-b border-border bg-ask/10 px-3 py-1.5 text-[11px] font-bold text-ask">Playbook seçin</div>
+      <div className="border-b border-border bg-ask/10 px-3 py-1.5 text-[11px] font-bold text-ask">Skill seçin</div>
       <div className="max-h-44 divide-y divide-border/40 overflow-y-auto">{filteredPlaybooks.map((playbook) => <button key={playbook.tag} onClick={() => { const at = inputText.lastIndexOf("@"); setInputText(`${inputText.slice(0, at)}@${playbook.tag} `); setShowMentionPicker(false); }} className="flex w-full items-center justify-between p-2 text-left text-xs hover:bg-ask/10">
         <div><div className="font-mono font-bold text-ask">@{playbook.tag}</div><div className="font-medium text-white">{playbook.title}</div></div>
       </button>)}</div>
     </div>}
 
     <div className="relative flex items-center gap-2 border-t border-border bg-base-panel p-2.5">
-      <input value={inputText} onChange={handleInputChange} onKeyDown={(event) => { if (event.key === "Enter" && !showMentionPicker) handleSend(); if (event.key === "Escape") setShowMentionPicker(false); }} placeholder="Sorununuzu yazın; güvenli kontroller otomatik çalıştırılır" className="flex-1 rounded-card border border-border bg-base-elevated px-3 py-1.5 text-sm outline-none transition-colors focus:border-ask" />
+      <input value={inputText} onChange={handleInputChange} onKeyDown={(event) => { if (event.key === "Enter" && !showMentionPicker) handleSend(); if (event.key === "Escape") setShowMentionPicker(false); }} placeholder="Sorununuzu yazın; @skill ile senaryo seçebilirsiniz" className="flex-1 rounded-card border border-border bg-base-elevated px-3 py-1.5 text-sm outline-none transition-colors focus:border-ask" />
       <button onClick={handleSend} className="rounded-card bg-ask p-2 font-medium text-white hover:bg-ask/90"><Send size={14} /></button>
     </div>
   </div>;

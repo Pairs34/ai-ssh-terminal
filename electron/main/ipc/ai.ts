@@ -4,7 +4,7 @@ import { eq, desc, asc } from "drizzle-orm";
 import { getDb } from "../database";
 import { devices, sessions, aiMessages, aiAgentRuns, commandLogs, customPrompts, playbooks } from "@database/schema";
 import { isCommandSafe, classifyCommandAccess, classifyRisk, requiresElevatedApproval } from "../ai/safety";
-import { callAiJson, callAiText, setAiConfig, getAiConfig, type AiProviderConfig } from "../ai/provider";
+import { callAiJson, callAiText, callAiTextStream, setAiConfig, getAiConfig, type AiProviderConfig } from "../ai/provider";
 import { sshManager } from "../ssh/manager";
 import { resolveDeviceConnection } from "../ssh/resolveConnection";
 import {
@@ -82,21 +82,91 @@ function fillTemplate(template: string, params: Record<string, string>): string 
   return template.replace(/\{(\w+)\}/g, (_match, key) => params[key] ?? "");
 }
 
-async function ensureDeviceMetadata(deviceId: number) {
+function identityIsComplete(device: {
+  vendor?: string | null;
+  model?: string | null;
+  os?: string | null;
+  osVersion?: string | null;
+}): boolean {
+  const vendor = String(device.vendor || "").trim();
+  const os = String(device.os || "").trim();
+  return Boolean(
+    vendor &&
+    os &&
+    device.osVersion &&
+    vendor !== "Bilinmiyor" &&
+    vendor !== "Genel" &&
+    os !== "Bilinmiyor"
+  );
+}
+
+function parseDeviceIdentity(raw: string, fallback: {
+  vendor?: string | null;
+  model?: string | null;
+  os?: string | null;
+  osVersion?: string | null;
+  deviceType?: string | null;
+}) {
+  let vendor = fallback.vendor || "Genel";
+  let osType = fallback.os || "Bilinmiyor";
+  let osVersion = fallback.osVersion || null;
+  let model = fallback.model || null;
+  let deviceType = fallback.deviceType || "unknown";
+
+  if (raw.includes("AOS-CX")) {
+    vendor = "Aruba / HPE";
+    osType = "ArubaOS-CX";
+    deviceType = deviceType === "unknown" ? "switch" : deviceType;
+  } else if (raw.includes("Comware")) {
+    vendor = "HPE / H3C";
+    osType = "Comware";
+    deviceType = deviceType === "unknown" ? "switch" : deviceType;
+  } else if (raw.includes("Cisco") || raw.includes("IOS-XE") || raw.includes("NX-OS") || /\bIOS\b/.test(raw)) {
+    vendor = "Cisco";
+    osType = raw.includes("NX-OS") ? "Cisco NX-OS" : raw.includes("IOS-XE") ? "Cisco IOS-XE" : "Cisco IOS";
+    deviceType = deviceType === "unknown" ? "switch" : deviceType;
+  } else if (raw.includes("Huawei") || raw.includes("VRP")) {
+    vendor = "Huawei";
+    osType = "VRP";
+  } else if (raw.includes("FortiGate") || raw.includes("FortiOS")) {
+    vendor = "Fortinet";
+    osType = "FortiOS";
+    deviceType = deviceType === "unknown" ? "firewall" : deviceType;
+  } else if (raw.includes("Juniper") || raw.includes("JUNOS")) {
+    vendor = "Juniper";
+    osType = "JunOS";
+  } else if (raw.includes("Linux") || raw.includes("GNU/Linux")) {
+    vendor = vendor === "Genel" || vendor === "Bilinmiyor" ? "Linux" : vendor;
+    osType = "Linux";
+    deviceType = deviceType === "unknown" ? "linux_server" : deviceType;
+  }
+
+  const versionMatch = raw.match(/(?:Version|v|release|Firmware)\s*[:=]?\s*(\d+(?:\.\d+){1,3}(?:[-A-Za-z0-9.]*)?)/i);
+  if (versionMatch) osVersion = versionMatch[1];
+  const modelMatch = raw.match(/(?:Model(?:\s*number)?|Platform|Hardware|Product(?:\s*Name)?)\s*[:=]\s*([^\r\n]+)/i);
+  if (modelMatch) model = modelMatch[1].trim().slice(0, 120);
+  if (!model) {
+    const arubaModel = raw.match(/\b(6[0-9]{3}[A-Z0-9-]*)\b/);
+    if (arubaModel) model = arubaModel[1];
+  }
+
+  return { vendor, os: osType, osVersion, model, deviceType };
+}
+
+async function ensureDeviceMetadata(deviceId: number, options?: { force?: boolean }) {
   const db = getDb();
   const device = db.select().from(devices).where(eq(devices.id, deviceId)).get();
   if (!device) return null;
 
-  if (device.vendor && device.os && device.osVersion && device.vendor !== "Bilinmiyor") {
+  if (!options?.force && identityIsComplete(device) && device.model) {
     return device;
   }
 
-  // Cihaz marka / OS tespiti yapılmamışsa hızlıca sorguluyoruz
   try {
     const connection = resolveDeviceConnection(deviceId);
     const probes = device.vendor?.toLowerCase().includes("forti")
-      ? ["get system status", "show version", "display version", "uname -a"]
-      : ["show version", "get system status", "display version", "uname -a"];
+      ? ["get system status", "show system status", "show version", "display version", "uname -a"]
+      : ["show version", "get system status", "display version", "uname -a", "cat /etc/os-release"];
     let raw = "";
     for (const probe of probes) {
       const tmpSessionId = `probe-${deviceId}-${Date.now()}`;
@@ -107,45 +177,81 @@ async function ensureDeviceMetadata(deviceId: number) {
       }
     }
 
-    let vendor = device.vendor || "Genel";
-    let osType = device.os || "Bilinmiyor";
-    let osVersion = device.osVersion || null;
-    let model = device.model || null;
+    if (!raw) return device;
 
-    if (raw.includes("AOS-CX")) {
-      vendor = "Aruba / HPE";
-      osType = "ArubaOS-CX";
-    } else if (raw.includes("Comware")) {
-      vendor = "HPE / H3C";
-      osType = "Comware";
-    } else if (raw.includes("Cisco") || raw.includes("IOS")) {
-      vendor = "Cisco";
-      osType = "Cisco IOS";
-    } else if (raw.includes("Huawei") || raw.includes("VRP")) {
-      vendor = "Huawei";
-      osType = "VRP";
-    } else if (raw.includes("FortiGate") || raw.includes("FortiOS")) {
-      vendor = "Fortinet";
-      osType = "FortiOS";
-    } else if (raw.includes("Linux")) {
-      vendor = "Linux";
-      osType = "Linux";
-    }
-
-    const versionMatch = raw.match(/(?:Version|v|release)\s*[:=]?\s*(\d+(?:\.\d+){1,3}(?:[-A-Za-z0-9.]*)?)/i);
-    if (versionMatch) osVersion = versionMatch[1];
-    const modelMatch = raw.match(/(?:Model|Platform|Serial-Number)\s*[:=]\s*([^\r\n]+)/i);
-    if (modelMatch && /model|platform/i.test(modelMatch[0])) model = modelMatch[1].trim().slice(0, 120);
-
+    const parsed = parseDeviceIdentity(raw, device);
+    const nextDeviceType = (["switch", "router", "firewall", "access_point", "linux_server", "windows_server", "storage", "hypervisor", "unknown"].includes(parsed.deviceType)
+      ? parsed.deviceType
+      : device.deviceType) as typeof device.deviceType;
     db.update(devices)
-      .set({ vendor, os: osType, osVersion, model })
+      .set({
+        vendor: parsed.vendor,
+        os: parsed.os,
+        osVersion: parsed.osVersion,
+        model: parsed.model,
+        deviceType: nextDeviceType,
+        updatedAt: new Date().toISOString()
+      })
       .where(eq(devices.id, deviceId))
       .run();
 
-    return { ...device, vendor, os: osType, osVersion, model };
+    return { ...device, vendor: parsed.vendor, os: parsed.os, osVersion: parsed.osVersion, model: parsed.model, deviceType: nextDeviceType };
   } catch {
     return device;
   }
+}
+
+function buildEnabledRulesContext(): string {
+  const db = getDb();
+  const rules = db.select().from(customPrompts).all().filter((rule) => rule.enabled);
+  if (!rules.length) return "";
+  const ordered = [
+    ...rules.filter((rule) => rule.isDefault),
+    ...rules.filter((rule) => !rule.isDefault)
+  ];
+  return ordered
+    .map((rule) => `[AI KURALI: ${rule.title}]\n${rule.promptText}`)
+    .join("\n\n");
+}
+
+function buildEnabledSkillsContext(question: string): string {
+  const db = getDb();
+  const skills = db.select().from(playbooks).all();
+  const alwaysOn = skills.filter((skill) => skill.enabled);
+  const mentionMatch = question.match(/@([a-zA-Z0-9_-]+)/);
+  const mentioned = mentionMatch
+    ? skills.find((skill) => skill.tag.toLowerCase() === mentionMatch[1].toLowerCase())
+    : undefined;
+
+  const blocks: string[] = [];
+  if (alwaysOn.length) {
+    blocks.push(
+      `AKTİF SKILL'LER (her zaman uygulanır):\n${alwaysOn
+        .map((skill) => `- @${skill.tag} (${skill.title}): ${skill.instructions}`)
+        .join("\n")}`
+    );
+  }
+  if (mentioned) {
+    blocks.push(
+      `SEÇİLİ SKILL / PLAYBOOK: '${mentioned.title}' (@${mentioned.tag})\nTALİMATLAR:\n${mentioned.instructions}\nBu skill adımlarını sırasıyla ve eksiksiz uygula.`
+    );
+  }
+  return blocks.join("\n\n");
+}
+
+function buildRecentCommandSummary(sessionId: number): string {
+  const db = getDb();
+  const recent = db
+    .select()
+    .from(commandLogs)
+    .where(eq(commandLogs.sessionId, sessionId))
+    .orderBy(desc(commandLogs.id))
+    .all()
+    .slice(0, 8);
+  if (!recent.length) return "";
+  return recent
+    .map((item) => `- [${item.mode}] ${item.command}${item.result ? ` → ${String(item.result).slice(0, 160)}` : ""}`)
+    .join("\n");
 }
 
 const activeAborts = new Map<number, boolean>();
@@ -195,19 +301,33 @@ export function registerAiHandlers() {
     return db.select().from(customPrompts).all();
   });
 
-  ipcMain.handle("prompts:save", async (_event, data: { id?: number; title: string; promptText: string; isDefault?: boolean }) => {
+  ipcMain.handle("prompts:save", async (_event, data: {
+    id?: number; title: string; promptText: string; isDefault?: boolean; enabled?: boolean;
+  }) => {
     const db = getDb();
     if (data.isDefault) {
       db.update(customPrompts).set({ isDefault: false }).run();
     }
+    const enabled = data.enabled !== false;
     if (data.id) {
       db.update(customPrompts)
-        .set({ title: data.title, promptText: data.promptText, isDefault: data.isDefault || false, updatedAt: new Date().toISOString() })
+        .set({
+          title: data.title,
+          promptText: data.promptText,
+          isDefault: data.isDefault || false,
+          enabled,
+          updatedAt: new Date().toISOString()
+        })
         .where(eq(customPrompts.id, data.id))
         .run();
     } else {
       db.insert(customPrompts)
-        .values({ title: data.title, promptText: data.promptText, isDefault: data.isDefault || false })
+        .values({
+          title: data.title,
+          promptText: data.promptText,
+          isDefault: data.isDefault || false,
+          enabled
+        })
         .run();
     }
     return { success: true };
@@ -216,12 +336,23 @@ export function registerAiHandlers() {
   ipcMain.handle("prompts:setDefault", async (_event, id: number) => {
     const db = getDb();
     db.update(customPrompts).set({ isDefault: false }).run();
-    db.update(customPrompts).set({ isDefault: true }).where(eq(customPrompts.id, id)).run();
+    db.update(customPrompts).set({ isDefault: true, enabled: true }).where(eq(customPrompts.id, id)).run();
+    return { success: true };
+  });
+
+  ipcMain.handle("prompts:setEnabled", async (_event, id: number, enabled: boolean) => {
+    const db = getDb();
+    db.update(customPrompts).set({ enabled, updatedAt: new Date().toISOString() }).where(eq(customPrompts.id, id)).run();
     return { success: true };
   });
 
   ipcMain.handle("prompts:delete", async (_event, id: number) => {
     const db = getDb();
+    const existing = db.select().from(customPrompts).where(eq(customPrompts.id, id)).get();
+    if (existing?.ruleKey === "device-identity") {
+      db.update(customPrompts).set({ enabled: false, updatedAt: new Date().toISOString() }).where(eq(customPrompts.id, id)).run();
+      return { success: true, disabledBuiltin: true };
+    }
     db.delete(customPrompts).where(eq(customPrompts.id, id)).run();
     return { success: true };
   });
@@ -232,19 +363,41 @@ export function registerAiHandlers() {
     return db.select().from(playbooks).all();
   });
 
-  ipcMain.handle("playbooks:save", async (_event, data: { id?: number; tag: string; title: string; description?: string; instructions: string }) => {
+  ipcMain.handle("playbooks:save", async (_event, data: {
+    id?: number; tag: string; title: string; description?: string; instructions: string; enabled?: boolean;
+  }) => {
     const db = getDb();
     const cleanTag = data.tag.replace(/^@/, "").trim();
+    const enabled = Boolean(data.enabled);
     if (data.id) {
       db.update(playbooks)
-        .set({ tag: cleanTag, title: data.title, description: data.description || "", instructions: data.instructions, updatedAt: new Date().toISOString() })
+        .set({
+          tag: cleanTag,
+          title: data.title,
+          description: data.description || "",
+          instructions: data.instructions,
+          enabled,
+          updatedAt: new Date().toISOString()
+        })
         .where(eq(playbooks.id, data.id))
         .run();
     } else {
       db.insert(playbooks)
-        .values({ tag: cleanTag, title: data.title, description: data.description || "", instructions: data.instructions })
+        .values({
+          tag: cleanTag,
+          title: data.title,
+          description: data.description || "",
+          instructions: data.instructions,
+          enabled
+        })
         .run();
     }
+    return { success: true };
+  });
+
+  ipcMain.handle("playbooks:setEnabled", async (_event, id: number, enabled: boolean) => {
+    const db = getDb();
+    db.update(playbooks).set({ enabled, updatedAt: new Date().toISOString() }).where(eq(playbooks.id, id)).run();
     return { success: true };
   });
 
@@ -300,8 +453,6 @@ export function registerAiHandlers() {
   ipcMain.handle("ai:ask", async (event, request: AskRequest) => {
     const db = getDb();
     ensureSession(request.deviceId, request.sessionId);
-    let device = await ensureDeviceMetadata(request.deviceId);
-    if (!device) throw new Error("Cihaz bulunamadı.");
 
     activeAborts.set(request.sessionId, false);
 
@@ -312,10 +463,33 @@ export function registerAiHandlers() {
     const sendStatus = (step: string, message: string) => {
       event.sender.send("ai:status", { sessionId: request.sessionId, step, message });
     };
+    const sendStep = (payload: {
+      id: string;
+      kind: string;
+      title: string;
+      detail?: string;
+      status: "running" | "done" | "error";
+    }) => {
+      event.sender.send("ai:step", { sessionId: request.sessionId, ...payload });
+    };
+    const sendToken = (token: string) => {
+      event.sender.send("ai:token", { sessionId: request.sessionId, token });
+    };
 
     sendStatus("probe", "🔍 Cihaz marka/OS kontrol ediliyor...");
+    sendStep({ id: "identity", kind: "probe", title: "Cihaz kimliği doğrulanıyor", status: "running" });
+    let device = await ensureDeviceMetadata(request.deviceId, { force: !identityIsComplete(
+      db.select().from(devices).where(eq(devices.id, request.deviceId)).get() || {}
+    ) });
+    if (!device) throw new Error("Cihaz bulunamadı.");
+    sendStep({
+      id: "identity",
+      kind: "probe",
+      title: "Cihaz kimliği",
+      detail: `${device.vendor || "?"} / ${device.model || "model?"} · ${device.os || "?"} ${device.osVersion || ""}`.trim(),
+      status: identityIsComplete(device) ? "done" : "error"
+    });
 
-    // Mevcut prompt zaten ayrıca gönderildiği için yalnızca önceki mesajları bağlama ekliyoruz.
     const history = db
       .select()
       .from(aiMessages)
@@ -323,21 +497,29 @@ export function registerAiHandlers() {
       .all()
       .slice(0, -1)
       .filter((message) => message.role === "user" || message.role === "assistant")
-      .slice(-6)
+      .slice(-16)
       .map((m) => ({
         role: m.role as "user" | "assistant",
-        content: m.content.length > 800 ? m.content.substring(0, 800) + "... [Özet]" : m.content
+        content: m.content.length > 1200 ? m.content.substring(0, 1200) + "... [Özet]" : m.content
       }));
 
-    const deviceContext = `
-Cihaz Adı: ${device.name}
-IP Adresi: ${device.ipAddress}
-Cihaz Türü: ${device.deviceType}
-Marka / Üretici (Vendor): ${device.vendor || "Aruba / HPE / Cisco / Linux vb."}
-Model: ${device.model || "Bilinmiyor"}
-İşletim Sistemi (OS): ${device.os || "Bilinmiyor (Örn: AOS-CX, Comware, Cisco IOS, Linux)"}
-OS Sürümü: ${device.osVersion || "Bilinmiyor"}
+    const recentCommandSummary = buildRecentCommandSummary(request.sessionId);
+    const rulesContext = buildEnabledRulesContext();
+    const skillsContext = buildEnabledSkillsContext(request.question);
+    const identityGate = identityIsComplete(device)
+      ? ""
+      : "\nÖNCELİK: Cihaz kimliği eksik. İlk adımda yalnızca salt-okunur kimlik keşif komutu seç (show version / get system status / display version / uname -a). Vendor-spesifik teşhis komutunu kimlik doğrulanmadan üretme.\n";
+
+    const buildDeviceContext = (current: NonNullable<typeof device>) => `
+Cihaz Adı: ${current.name}
+IP Adresi: ${current.ipAddress}
+Cihaz Türü: ${current.deviceType}
+Marka / Üretici (Vendor): ${current.vendor || "Bilinmiyor"}
+Model: ${current.model || "Bilinmiyor"}
+İşletim Sistemi (OS): ${current.os || "Bilinmiyor (Örn: AOS-CX, Comware, Cisco IOS, Linux)"}
+OS Sürümü: ${current.osVersion || "Bilinmiyor"}
 `;
+    let deviceContext = buildDeviceContext(device);
 
     const connection = resolveDeviceConnection(request.deviceId);
 
@@ -430,20 +612,12 @@ Yanıt Formatı (JSON):
   }
 }
 
-    // Playbook mention detection (e.g. @FiberTroubleshoot)
-    let playbookContext = "";
-    const mentionMatch = request.question.match(/@([a-zA-Z0-9_-]+)/);
-    if (mentionMatch) {
-      const tag = mentionMatch[1];
-      const pb = db.select().from(playbooks).where(eq(playbooks.tag, tag)).get();
-      if (pb) {
-        playbookContext = `\n📋 SEÇİLİ PLAYBOOK YÖNERGESİ: '${pb.title}' (@${pb.tag})\nPLAYBOOK ADIMLARI VE KESİN TALİMATLARI:\n${pb.instructions}\nLütfen bu Playbook talimatlarındaki TÜM komutları sırasıyla ve eksiksiz canlı terminalde çalıştır!\n`;
-      }
-    }
-
-    // Default Custom Prompt lookup
-    const customDefaultPrompt = db.select().from(customPrompts).where(eq(customPrompts.isDefault, true)).get();
-    const systemPromptPrefix = customDefaultPrompt ? `${customDefaultPrompt.promptText}\n\n` : "";
+    const systemPromptPrefix = [
+      rulesContext,
+      skillsContext,
+      identityGate,
+      recentCommandSummary ? `SON OTURUM KOMUT ÖZETİ:\n${recentCommandSummary}` : ""
+    ].filter(Boolean).join("\n\n");
 
     // Metadata-filtered command KB is consulted before document KB or AI suggestions.
     const commandCandidates = retrieveCommands(request.question, {
@@ -483,12 +657,20 @@ Yanıt Formatı (JSON):
       }
 
       currentStep++;
+      const stepId = `diag-${currentStep}`;
       sendStatus(
         "generating",
         currentStep > 1
           ? `🔍 Derin teşhis verileri toplanıyor (Adım ${currentStep}/${maxSteps})...`
           : "🧠 Teşhis komutu üretiliyor..."
       );
+      sendStep({
+        id: stepId,
+        kind: "diagnose",
+        title: `Teşhis adımı ${currentStep}/${maxSteps}`,
+        detail: currentStep > 1 ? "Eksik veri için sonraki komut planlanıyor" : "İlk salt-okunur komut seçiliyor",
+        status: "running"
+      });
 
       const failedNotice =
         failedCommandsInSession.length > 0 || safetyRejectedCommands.length > 0
@@ -505,11 +687,10 @@ Yanıt Formatı (JSON):
       const choice = await callAiJson<{ command: string; commandId?: number; reasoning: string }>([
         {
           role: "system",
-          content: `${systemPromptPrefix}Sen uzman bir Ağ ve Sistem AI Mühendisinisin. 
+          content: `${systemPromptPrefix ? `${systemPromptPrefix}\n\n` : ""}Sen uzman bir Ağ ve Sistem AI Mühendisinisin. 
 Aktif Cihaz Bilgileri:
 ${deviceContext}
 ${ragContext}
-${playbookContext}
 ${failedNotice}
 ${discoveryNotice}
 ${documentContext ? `\nDOKÜMAN BİLGİ TABANI BAĞLAMI:\n${documentContext}` : ""}
@@ -538,12 +719,20 @@ Yanıt formatı (JSON): {"command": "çalıştırılacak_tam_komut", "commandId"
       ]);
 
       lastCommand = choice.command.trim();
+      sendStep({
+        id: stepId,
+        kind: "diagnose",
+        title: `Teşhis adımı ${currentStep}/${maxSteps}`,
+        detail: choice.reasoning || lastCommand,
+        status: "running"
+      });
       const access = classifyCommandAccess(lastCommand);
       if (access.kind !== "auto_execute") {
         const reason = access.reason;
         safetyRejectedCommands.push({ command: lastCommand, reason });
         missingFeedback = `Önerilen komut çalıştırılmadan güvenlik filtresinde reddedildi: ${reason} Sistem durumunu değiştirmeyen bir veri toplama alternatifi seç.`;
         sendStatus("generating", `🛡️ Güvenli olmayan komut çalıştırılmadı; salt okunur alternatif hazırlanıyor (${currentStep}/${maxSteps})...`);
+        sendStep({ id: stepId, kind: "diagnose", title: `Teşhis adımı ${currentStep}/${maxSteps}`, detail: reason, status: "error" });
         continue;
       }
 
@@ -567,6 +756,13 @@ Yanıt formatı (JSON): {"command": "çalıştırılacak_tam_komut", "commandId"
       }).id;
 
       sendStatus("executing", `⚡ Live Terminalde Çalıştırılıyor (${currentStep}/${maxSteps}): \`${lastCommand}\``);
+      sendStep({
+        id: stepId,
+        kind: "execute",
+        title: `Çalıştırılıyor: ${lastCommand}`,
+        detail: choice.reasoning || undefined,
+        status: "running"
+      });
 
       let cmdOutput = "";
       let cmdExitCode: number | null = null;
@@ -586,7 +782,33 @@ Yanıt formatı (JSON): {"command": "çalıştırılacak_tam_komut", "commandId"
         cmdOutput = `[Komut çalıştırma hatası: ${(err as Error).message}]`;
       }
 
-      // 1. AI Komut Geçerlilik Hakemi
+      if (!identityIsComplete(device) && validateCommandOutput(cmdOutput).status === "success") {
+        const refreshed = parseDeviceIdentity(cmdOutput, device);
+        const nextDeviceType = (["switch", "router", "firewall", "access_point", "linux_server", "windows_server", "storage", "hypervisor", "unknown"].includes(refreshed.deviceType)
+          ? refreshed.deviceType
+          : device.deviceType) as "switch" | "router" | "firewall" | "access_point" | "linux_server" | "windows_server" | "storage" | "hypervisor" | "unknown";
+        db.update(devices)
+          .set({
+            vendor: refreshed.vendor,
+            os: refreshed.os,
+            osVersion: refreshed.osVersion,
+            model: refreshed.model,
+            deviceType: nextDeviceType,
+            updatedAt: new Date().toISOString()
+          })
+          .where(eq(devices.id, request.deviceId))
+          .run();
+        device = { ...device, vendor: refreshed.vendor, os: refreshed.os, osVersion: refreshed.osVersion, model: refreshed.model, deviceType: nextDeviceType };
+        deviceContext = buildDeviceContext(device);
+        sendStep({
+          id: "identity",
+          kind: "probe",
+          title: "Cihaz kimliği güncellendi",
+          detail: `${device.vendor || "?"} / ${device.model || "model?"} · ${device.os || "?"} ${device.osVersion || ""}`.trim(),
+          status: "done"
+        });
+      }
+
       sendStatus("evaluating", `🔎 AI Çıktı Geçerliliğini Doğruluyor...`);
       const evalResult = await evaluateCommandResult(deviceContext, lastCommand, cmdOutput);
       const validation = recordExecution({
@@ -608,7 +830,13 @@ Yanıt formatı (JSON): {"command": "çalıştırılacak_tam_komut", "commandId"
         missingFeedback = `Komut '${lastCommand}' cihaz tarafından reddedildi (${evalResult.issue || validation.reason}). ${
           evalResult.alternativeCommand ? `Önerilen: ${evalResult.alternativeCommand}` : ""
         }`;
-        // Version-dependent CLIs are discovered through their own help tree.
+        sendStep({
+          id: stepId,
+          kind: "execute",
+          title: `Başarısız: ${lastCommand}`,
+          detail: evalResult.issue || validation.reason || "Çıktı doğrulanamadı",
+          status: "error"
+        });
         for (const helpCommand of buildCliHelpProbes(lastCommand, device.os)) {
           const helpSafety = isCommandSafe(helpCommand, "ask");
           if (!helpSafety.safe) continue;
@@ -630,8 +858,14 @@ Yanıt formatı (JSON): {"command": "çalıştırılacak_tam_komut", "commandId"
       }
 
       collectedOutputs.push({ command: lastCommand, output: cmdOutput });
+      sendStep({
+        id: stepId,
+        kind: "execute",
+        title: `Toplandı: ${lastCommand}`,
+        detail: cmdOutput.slice(0, 240),
+        status: "done"
+      });
 
-      // 2. AI Veri Yeterlilik Hakemi: Kullanıcı sorusuna yanıt vermek için yeterli veri toplandı mı?
       sendStatus("evaluating", `📊 AI Veri Yeterliliğini Kontrol Ediyor...`);
       const suffResult = await evaluateSufficiency(deviceContext, request.question, collectedOutputs);
 
@@ -679,17 +913,17 @@ Yanıt formatı (JSON): {"command": "çalıştırılacak_tam_komut", "commandId"
     }
 
     sendStatus("analyzing", "📊 Canlı terminal çıktılarının tümü AI ile analiz ediliyor...");
+    sendStep({ id: "analyze", kind: "analyze", title: "Sonuç analizi yazılıyor", status: "running" });
 
     let trimmedCombinedOutput = combinedOutputs;
     if (combinedOutputs.length > 30000) {
       trimmedCombinedOutput = combinedOutputs.substring(combinedOutputs.length - 30000);
     }
 
-    // Çıktıyı inceleyip Türkçe detaylı ZENGİN MARKDOWN TABLOLU analiz yanıtı sentezleme
-    const explanationText = await callAiText([
+    const explanationText = await callAiTextStream([
       {
         role: "system",
-        content: `Sen ağ ve sistem mühendisliği uzmanısın. Kullanıcının sorusunu ve cihazdan canlı SSH terminalinde alınan GERÇEK CİHAZ ÇIKTISINI Türkçe olarak net ve teknik açıdan zengin yorumla.
+        content: `${systemPromptPrefix ? `${systemPromptPrefix}\n\n` : ""}Sen ağ ve sistem mühendisliği uzmanısın. Kullanıcının sorusunu ve cihazdan canlı SSH terminalinde alınan GERÇEK CİHAZ ÇIKTISINI Türkçe olarak net ve teknik açıdan zengin yorumla.
 
 🚨 KRİTİK YAZIM VE PERSONA KURALLARI (KESİNLİKLE UYULMALIDIR):
 1. Salt-okunur teşhis komutlarını canlı SSH terminalinde kendin çalıştıran bir sistem mühendisisin.
@@ -706,7 +940,8 @@ ${documentContext ? `8. Doküman bilgisi kullanırsan doküman adı, bölüm ve 
         role: "user",
         content: `Cihaz: ${device.name} (${device.vendor || ""} ${device.os || ""} ${device.osVersion || ""})\nKullanıcı Soru: ${request.question}\nBaşarıyla doğrulanan komutlar: ${allExecutedCommands}\n\nGERÇEK VE DOĞRULANMIŞ CİHAZ ÇIKTILARI:\n${trimmedCombinedOutput}`
       }
-    ]);
+    ], sendToken);
+    sendStep({ id: "analyze", kind: "analyze", title: "Sonuç analizi hazır", status: "done" });
 
     let pendingApproval: null | {
       command: string;
@@ -829,14 +1064,16 @@ JSON: {"action":"none|propose","command":"...","reasoning":"...","precheckComman
       .all()
       .slice(0, -1)
       .filter((message) => message.role === "user" || message.role === "assistant")
-      .slice(-6)
+      .slice(-16)
       .map((message) => ({
         role: message.role as "user" | "assistant",
-        content: message.content.length > 800 ? `${message.content.slice(0, 800)}... [Özet]` : message.content
+        content: message.content.length > 1200 ? `${message.content.slice(0, 1200)}... [Özet]` : message.content
       }));
 
     const connection = resolveDeviceConnection(request.deviceId);
-    const deviceContext = `Cihaz: ${device.name}\nTür: ${device.deviceType}\nVendor: ${device.vendor || "Bilinmiyor"}\nModel: ${device.model || "Bilinmiyor"}\nPlatform: ${device.os || "Bilinmiyor"}\nSürüm: ${device.osVersion || "Bilinmiyor"}\nSSH Kullanıcısı: ${connection.username}`;
+    const rulesContext = buildEnabledRulesContext();
+    const skillsContext = buildEnabledSkillsContext(request.instruction);
+    const deviceContext = `Cihaz: ${device.name}\nTür: ${device.deviceType}\nVendor: ${device.vendor || "Bilinmiyor"}\nModel: ${device.model || "Bilinmiyor"}\nPlatform: ${device.os || "Bilinmiyor"}\nSürüm: ${device.osVersion || "Bilinmiyor"}\nSSH Kullanıcısı: ${connection.username}${rulesContext ? `\n\n${rulesContext}` : ""}${skillsContext ? `\n\n${skillsContext}` : ""}`;
     const modifyCandidates = retrieveCommands(request.instruction, {
       vendor: device.vendor, platform: device.os, deviceType: device.deviceType, osVersion: device.osVersion,
       executionMode: "modify", includeLearned: true
@@ -977,14 +1214,16 @@ JSON: {"action":"none|propose","command":"...","reasoning":"...","precheckComman
       .all();
     const agentHistory = (request.runId ? historyRows : historyRows.slice(0, -1))
       .filter((message) => message.role === "user" || message.role === "assistant")
-      .slice(-6)
+      .slice(-16)
       .map((message) => ({
         role: message.role as "user" | "assistant",
-        content: message.content.length > 800 ? `${message.content.slice(0, 800)}... [Özet]` : message.content
+        content: message.content.length > 1200 ? `${message.content.slice(0, 1200)}... [Özet]` : message.content
       }));
 
     const connection = resolveDeviceConnection(request.deviceId);
-    const deviceContext = `Cihaz: ${device.name}\nTür: ${device.deviceType}\nVendor: ${device.vendor || "Bilinmiyor"}\nModel: ${device.model || "Bilinmiyor"}\nPlatform: ${device.os || "Bilinmiyor"}\nSürüm: ${device.osVersion || "Bilinmiyor"}\nSSH Kullanıcısı: ${connection.username}`;
+    const agentRulesContext = buildEnabledRulesContext();
+    const agentSkillsContext = buildEnabledSkillsContext(instruction);
+    const deviceContext = `Cihaz: ${device.name}\nTür: ${device.deviceType}\nVendor: ${device.vendor || "Bilinmiyor"}\nModel: ${device.model || "Bilinmiyor"}\nPlatform: ${device.os || "Bilinmiyor"}\nSürüm: ${device.osVersion || "Bilinmiyor"}\nSSH Kullanıcısı: ${connection.username}${agentRulesContext ? `\n\n${agentRulesContext}` : ""}${agentSkillsContext ? `\n\n${agentSkillsContext}` : ""}`;
     const candidates = retrieveCommands(instruction, {
       vendor: device.vendor, platform: device.os, deviceType: device.deviceType, osVersion: device.osVersion,
       executionMode: "modify", includeLearned: true

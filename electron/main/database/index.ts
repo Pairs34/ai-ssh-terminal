@@ -230,6 +230,8 @@ function initTables(db: Database.Database) {
       "title" text NOT NULL,
       "prompt_text" text NOT NULL,
       "is_default" integer DEFAULT 0 NOT NULL,
+      "enabled" integer DEFAULT 1 NOT NULL,
+      "rule_key" text,
       "created_at" text DEFAULT CURRENT_TIMESTAMP,
       "updated_at" text DEFAULT CURRENT_TIMESTAMP
     );
@@ -239,6 +241,7 @@ function initTables(db: Database.Database) {
       "title" text NOT NULL,
       "description" text,
       "instructions" text NOT NULL,
+      "enabled" integer DEFAULT 0 NOT NULL,
       "created_at" text DEFAULT CURRENT_TIMESTAMP,
       "updated_at" text DEFAULT CURRENT_TIMESTAMP
     );
@@ -252,6 +255,17 @@ function initTables(db: Database.Database) {
   const chunkColumns = db.prepare("PRAGMA table_info(rag_document_chunks)").all() as Array<{ name: string }>;
   if (!chunkColumns.some((column) => column.name === "heading_level")) {
     db.exec(`ALTER TABLE rag_document_chunks ADD COLUMN heading_level integer`);
+  }
+  const promptColumns = db.prepare("PRAGMA table_info(custom_prompts)").all() as Array<{ name: string }>;
+  if (!promptColumns.some((column) => column.name === "enabled")) {
+    db.exec(`ALTER TABLE custom_prompts ADD COLUMN enabled integer DEFAULT 1 NOT NULL`);
+  }
+  if (!promptColumns.some((column) => column.name === "rule_key")) {
+    db.exec(`ALTER TABLE custom_prompts ADD COLUMN rule_key text`);
+  }
+  const playbookColumns = db.prepare("PRAGMA table_info(playbooks)").all() as Array<{ name: string }>;
+  if (!playbookColumns.some((column) => column.name === "enabled")) {
+    db.exec(`ALTER TABLE playbooks ADD COLUMN enabled integer DEFAULT 0 NOT NULL`);
   }
 
   // Backward-compatible one-time lift from the old five-column memory.
@@ -283,9 +297,20 @@ function initTables(db: Database.Database) {
   const promptCount = db.prepare(`SELECT COUNT(*) as count FROM custom_prompts`).get() as { count: number };
   if (promptCount.count === 0) {
     db.exec(`
-      INSERT INTO custom_prompts (title, prompt_text, is_default) VALUES
-      ('Kıdemli Ağ Mühendisi (Varsayılan)', 'Sen uzman ve kıdemli bir Ağ ve Sistem AI Mühendisinisin. Canlı SSH terminalinde çalıştırılan komut çıktılarını inceleyerek derin teşhisler koyarsın. Kullanıcıya asla "aşağıdaki komutları çalıştırıp paylaşın" gibi tembel önerilerde bulunmazsın; ihtiyaç duyduğun verileri kendin otonom olarak toplar ve bulgularını zengin Markdown tabloları ile sunarsın.', 1);
+      INSERT INTO custom_prompts (title, prompt_text, is_default, enabled) VALUES
+      ('Kıdemli Ağ Mühendisi (Varsayılan)', 'Sen uzman ve kıdemli bir Ağ ve Sistem AI Mühendisinisin. Canlı SSH terminalinde çalıştırılan komut çıktılarını inceleyerek derin teşhisler koyarsın. Kullanıcıya asla "aşağıdaki komutları çalıştırıp paylaşın" gibi tembel önerilerde bulunmazsın; ihtiyaç duyduğun verileri kendin otonom olarak toplar ve bulgularını zengin Markdown tabloları ile sunarsın.', 1, 1);
     `);
+  }
+
+  const deviceIdentityRule = db.prepare(`SELECT id FROM custom_prompts WHERE rule_key = ?`).get("device-identity") as { id: number } | undefined;
+  if (!deviceIdentityRule) {
+    db.prepare(`
+      INSERT INTO custom_prompts (title, prompt_text, is_default, enabled, rule_key)
+      VALUES (?, ?, 0, 1, 'device-identity')
+    `).run(
+      "Cihaz Kimliği Önce (Varsayılan Kural)",
+      "Cihaza özel komut veya kod üretmeden önce salt-okunur SSH keşfiyle marka, model, OS ve firmware/sürüm kimliğini doğrula (show version, get system status, display version, uname -a vb.). Kimlik belirsizken vendor-spesifik sentaks tahmin etme; önce kimlik, sonra o platforma uyarlanmış teşhis komutları üret."
+    );
   }
 }
 
