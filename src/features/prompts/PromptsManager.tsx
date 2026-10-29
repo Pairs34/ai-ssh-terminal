@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Plus, Check, Trash2, Edit2, Sparkles, Star } from "lucide-react";
+import { Plus, Check, Trash2, Edit2, Sparkles, Star, Power } from "lucide-react";
 import type { CustomPrompt } from "@/types/ipc";
 
 export function PromptsManager() {
@@ -27,7 +27,8 @@ export function PromptsManager() {
       id: editing.id,
       title: editing.title,
       promptText: editing.promptText,
-      isDefault: editing.isDefault || false
+      isDefault: editing.isDefault || false,
+      enabled: editing.enabled !== false
     });
     setEditing(null);
     loadPrompts();
@@ -38,8 +39,13 @@ export function PromptsManager() {
     loadPrompts();
   };
 
+  const handleToggleEnabled = async (prompt: CustomPrompt) => {
+    await window.electronAPI.prompts.setEnabled(prompt.id, !prompt.enabled);
+    loadPrompts();
+  };
+
   const handleDelete = async (id: number) => {
-    if (confirm("Bu istemi silmek istediğinize emin misiniz?")) {
+    if (confirm("Bu kuralı silmek/devre dışı bırakmak istediğinize emin misiniz?")) {
       await window.electronAPI.prompts.delete(id);
       loadPrompts();
     }
@@ -51,31 +57,32 @@ export function PromptsManager() {
         <div>
           <h1 className="text-xl font-bold text-white flex items-center gap-2">
             <Sparkles size={20} className="text-ask" />
-            Özel AI Sistem İstemleri (Prompts)
+            AI Rules (Kurallar)
           </h1>
           <p className="text-xs text-muted-foreground mt-1">
-            AI'ın ağ cihazlarında ve sunucularda teşhis yaparken kullanacağı varsayılan persona ve yönergeleri özelleştirin.
+            Aktif kurallar her Ask/Modify isteğinde sistem bağlamına eklenir. Varsayılan persona birincil kuraldır; cihaz kimliği kuralı yerleşik olarak gelir.
           </p>
         </div>
         <button
           onClick={() =>
             setEditing({
-              title: "Yeni Sistem Prompt'u",
+              title: "Yeni Kural",
               promptText: "Sen uzman bir Kıdemli Ağ ve Ağ Güvenliği Mühendisinisin...",
-              isDefault: false
+              isDefault: false,
+              enabled: true
             })
           }
           className="flex items-center gap-1.5 bg-ask hover:bg-ask/90 text-white font-semibold px-4 py-2 rounded-card text-xs transition-colors"
         >
           <Plus size={15} />
-          Yeni Prompt Ekle
+          Yeni Kural Ekle
         </button>
       </div>
 
       {editing && (
         <div className="bg-base-panel border border-ask/40 rounded-card p-4 space-y-4 shadow-lg">
           <h2 className="text-sm font-semibold text-white">
-            {editing.id ? "Sistem Prompt'unu Düzenle" : "Yeni Sistem Prompt'u Oluştur"}
+            {editing.id ? "Kuralı Düzenle" : "Yeni Kural Oluştur"}
           </h2>
 
           <div className="space-y-3 text-xs">
@@ -84,13 +91,13 @@ export function PromptsManager() {
               <input
                 value={editing.title || ""}
                 onChange={(e) => setEditing((prev) => ({ ...prev, title: e.target.value }))}
-                placeholder="Örn: Kıdemli Ağ Mühendisi (Default)"
+                placeholder="Örn: Kıdemli Ağ Mühendisi"
                 className="w-full bg-base-elevated border border-border rounded px-3 py-1.5 outline-none focus:border-ask text-white"
               />
             </div>
 
             <div>
-              <label className="block text-muted-foreground mb-1">Sistem Prompt Yönerge Metni</label>
+              <label className="block text-muted-foreground mb-1">Kural / Sistem Yönergesi</label>
               <textarea
                 rows={6}
                 value={editing.promptText || ""}
@@ -100,16 +107,24 @@ export function PromptsManager() {
               />
             </div>
 
-            <div className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                id="isDefault"
-                checked={editing.isDefault || false}
-                onChange={(e) => setEditing((prev) => ({ ...prev, isDefault: e.target.checked }))}
-                className="rounded bg-base-elevated border-border text-ask"
-              />
-              <label htmlFor="isDefault" className="text-white cursor-pointer font-medium">
-                Varsayılan Sistem Prompt'u Olarak Ayarla
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="flex items-center gap-2 text-white cursor-pointer font-medium">
+                <input
+                  type="checkbox"
+                  checked={editing.enabled !== false}
+                  onChange={(e) => setEditing((prev) => ({ ...prev, enabled: e.target.checked }))}
+                  className="rounded bg-base-elevated border-border text-ask"
+                />
+                Aktif (her istekte enjekte et)
+              </label>
+              <label className="flex items-center gap-2 text-white cursor-pointer font-medium">
+                <input
+                  type="checkbox"
+                  checked={editing.isDefault || false}
+                  onChange={(e) => setEditing((prev) => ({ ...prev, isDefault: e.target.checked }))}
+                  className="rounded bg-base-elevated border-border text-ask"
+                />
+                Birincil persona kuralı
               </label>
             </div>
           </div>
@@ -132,10 +147,10 @@ export function PromptsManager() {
       )}
 
       {loading ? (
-        <div className="text-xs text-muted-foreground text-center py-10">Prompt'lar yükleniyor...</div>
+        <div className="text-xs text-muted-foreground text-center py-10">Kurallar yükleniyor...</div>
       ) : prompts.length === 0 ? (
         <div className="border border-dashed border-border rounded-card p-10 text-center text-xs text-muted-foreground">
-          Henüz özel bir sistem prompt'u tanımlanmadı. Şu anki dahili varsayılan sistem prompt'u kullanılıyor.
+          Henüz kural yok. Yerleşik cihaz kimliği kuralı uygulama açılışında otomatik eklenir.
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -143,27 +158,42 @@ export function PromptsManager() {
             <div
               key={p.id}
               className={`border rounded-card p-4 bg-base-panel/90 space-y-3 relative transition-all ${
-                p.isDefault ? "border-ask/60 shadow-ask/5 shadow-lg bg-ask/5" : "border-border"
+                p.enabled ? (p.isDefault ? "border-ask/60 shadow-ask/5 shadow-lg bg-ask/5" : "border-border") : "border-border/50 opacity-60"
               }`}
             >
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <h3 className="font-semibold text-sm text-white">{p.title}</h3>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2 min-w-0">
+                  <h3 className="font-semibold text-sm text-white truncate">{p.title}</h3>
                   {p.isDefault && (
                     <span className="flex items-center gap-1 text-[10px] bg-ask/20 text-ask border border-ask/30 px-2 py-0.5 rounded font-bold uppercase">
-                      <Star size={10} fill="currentColor" /> Varsayılan
+                      <Star size={10} fill="currentColor" /> Birincil
                     </span>
                   )}
+                  {p.ruleKey === "device-identity" && (
+                    <span className="text-[10px] bg-base-elevated text-muted-foreground border border-border px-2 py-0.5 rounded font-bold uppercase">
+                      Yerleşik
+                    </span>
+                  )}
+                  <span className={`text-[10px] border px-2 py-0.5 rounded font-bold uppercase ${p.enabled ? "border-success/30 bg-success/10 text-success" : "border-border text-muted-foreground"}`}>
+                    {p.enabled ? "Aktif" : "Kapalı"}
+                  </span>
                 </div>
 
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    onClick={() => handleToggleEnabled(p)}
+                    className="p-1 text-muted-foreground hover:text-ask rounded hover:bg-base-elevated"
+                    title={p.enabled ? "Devre dışı bırak" : "Etkinleştir"}
+                  >
+                    <Power size={13} />
+                  </button>
                   {!p.isDefault && (
                     <button
                       onClick={() => handleSetDefault(p.id)}
                       className="p-1 text-muted-foreground hover:text-ask transition-colors text-xs flex items-center gap-1 border border-border rounded px-2"
-                      title="Varsayılan Yap"
+                      title="Birincil Yap"
                     >
-                      <Star size={12} /> Varsayılan Yap
+                      <Star size={12} />
                     </button>
                   )}
                   <button
@@ -176,7 +206,7 @@ export function PromptsManager() {
                   <button
                     onClick={() => handleDelete(p.id)}
                     className="p-1 text-muted-foreground hover:text-danger rounded hover:bg-danger/20"
-                    title="Sil"
+                    title={p.ruleKey === "device-identity" ? "Devre dışı bırak" : "Sil"}
                   >
                     <Trash2 size={13} />
                   </button>

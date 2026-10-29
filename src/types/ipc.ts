@@ -136,6 +136,8 @@ export interface CustomPrompt {
   title: string;
   promptText: string;
   isDefault: boolean;
+  enabled: boolean;
+  ruleKey?: string | null;
   createdAt?: string | null;
   updatedAt?: string | null;
 }
@@ -146,8 +148,17 @@ export interface Playbook {
   title: string;
   description?: string | null;
   instructions: string;
+  enabled: boolean;
   createdAt?: string | null;
   updatedAt?: string | null;
+}
+
+export interface AiTimelineStep {
+  id: string;
+  kind: string;
+  title: string;
+  detail?: string;
+  status: "running" | "done" | "error";
 }
 
 export interface CommandParameter {
@@ -242,13 +253,15 @@ declare global {
       };
       prompts: {
         list: () => Promise<CustomPrompt[]>;
-        save: (data: { id?: number; title: string; promptText: string; isDefault?: boolean }) => Promise<{ success: boolean }>;
+        save: (data: { id?: number; title: string; promptText: string; isDefault?: boolean; enabled?: boolean }) => Promise<{ success: boolean }>;
         setDefault: (id: number) => Promise<{ success: boolean }>;
-        delete: (id: number) => Promise<{ success: boolean }>;
+        setEnabled: (id: number, enabled: boolean) => Promise<{ success: boolean }>;
+        delete: (id: number) => Promise<{ success: boolean; disabledBuiltin?: boolean }>;
       };
       playbooks: {
         list: () => Promise<Playbook[]>;
-        save: (data: { id?: number; tag: string; title: string; description?: string; instructions: string }) => Promise<{ success: boolean }>;
+        save: (data: { id?: number; tag: string; title: string; description?: string; instructions: string; enabled?: boolean }) => Promise<{ success: boolean }>;
+        setEnabled: (id: number, enabled: boolean) => Promise<{ success: boolean }>;
         delete: (id: number) => Promise<{ success: boolean }>;
       };
       rag: {
@@ -297,6 +310,8 @@ declare global {
         cancelSessionRequest: (sessionId: number) => Promise<{ success: boolean }>;
         clearHistory: (sessionId: number) => Promise<{ success: boolean }>;
         onStatus: (callback: (data: { sessionId: number; step: string; message: string }) => void) => () => void;
+        onStep: (callback: (data: { sessionId: number } & AiTimelineStep) => void) => () => void;
+        onToken: (callback: (data: { sessionId: number; token: string }) => void) => () => void;
       };
       csv: {
         importDevices: () => Promise<{ imported: number }>;

@@ -257,6 +257,8 @@ export const customPrompts = sqliteTable("custom_prompts", {
   title: text("title").notNull(),
   promptText: text("prompt_text").notNull(),
   isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  ruleKey: text("rule_key"),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`)
 });
@@ -267,6 +269,7 @@ export const playbooks = sqliteTable("playbooks", {
   title: text("title").notNull(),
   description: text("description"),
   instructions: text("instructions").notNull(),
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(false),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`)
 });
